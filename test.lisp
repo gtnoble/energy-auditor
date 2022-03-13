@@ -3,11 +3,11 @@
 (load "data-logger.lisp")
 (load "credentials.lisp")
 
-(defparameter bogus-meter 
+(defparameter *bogus-meter*
   (make-instance 'smart-meter-texas:electric-meter 
                  :esiid "abc" 
                  :meter-number "abd"))
-(defparameter long-meter 
+(defparameter *long-meter*
   (make-instance 'smart-meter-texas:electric-meter 
                  :esiid "sadkjfewafnawoenklamsclkmaelfjieafmlasmcaleifjlakrgnlajmlek" 
                  :meter-number "awer"))

@@ -17,7 +17,6 @@
                    :instrument instrument 
                    :channel channel 
                    :value value 
-                   :timestamp (get-current-unix-time)
                    :notes notes
                    ))
 

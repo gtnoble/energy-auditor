@@ -7,8 +7,10 @@
 (ql:quickload "parse-float")
 
 
-(defparameter cookie-jar (make-instance 'drakma:cookie-jar))
-(defparameter json-mime "application/json")
+(defparameter *cookie-jar* (make-instance 'drakma:cookie-jar))
+(defparameter *json-mime* "application/json")
+(defparameter *fetch-reading-retry-delay* 10)
+(defparameter *max-allowed-retry-attempts* 5)
 
 (defclass electric-meter ()
   ((esiid
@@ -37,7 +39,14 @@
      :initarg :session-token
      :initform (error "Must supply session token")
      :accessor session-token
-     :documentation "Must supply session token")))
+     :documentation "Must supply session token")
+   (retry-failure-count
+     :initform 0
+     :accessor retry-failure-count
+     :documentation "Counts the number of times a smart meter request has failed before succeeding"
+     )
+   )
+  )
 
 (defun parse-json (json-stream)
   (shasht:read-json 
@@ -72,15 +81,16 @@
                                                      '("rememberMe" . "true")
                                                      (cons "username" username)
                                                      (cons "password" password))
-                                       :content-type json-mime
-                                       :accept json-mime
-                                       :cookie-jar cookie-jar))))
+                                       :content-type *json-mime*
+                                       :accept *json-mime*
+                                       :cookie-jar *cookie-jar*))))
       (let ((error-message (gethash "errormessage" response)))
         (when (equal error-message "ERR-USR-USERNOTFOUND")
           (error 'user-not-found-error :username username))
         (when (equal error-message "ERR-USR-INVALIDPASSWORDERROR")
           (error 'invalid-password-error :password password)))
       (gethash "token" response))))
+
 
 (defun start-session (username password)
   "Start a smart meter reading session"
@@ -89,6 +99,8 @@
                  :password password 
                  :session-token (get-session-token username password)))
 
+
+
 (defun smart-meter-request (url meter token)
   "General function for interacting with Smart Meter Texas API"
   (let ((response (drakma:http-request url
@@ -96,11 +108,11 @@
                                        :parameters (list
                                                      (cons "ESIID" (esiid meter))
                                                      (cons "MeterNumber" (meter-number meter)))
-                                       :content-type json-mime
-                                       :accept json-mime
+                                       :content-type *json-mime*
+                                       :accept *json-mime*
                                        :additional-headers (list (cons "Authorization"  
                                                                        (concatenate 'string "Bearer " token)))
-                                       :cookie-jar cookie-jar)))
+                                       :cookie-jar *cookie-jar*)))
     (let ((parsed-response (parse-json response)))
       (let ((response-message (gethash "message" parsed-response))
             (response-data (gethash "data" parsed-response))) 
@@ -115,7 +127,9 @@
                   (t (error "Unknown error ~a" response-error-message))))
           response-data)))))
 
-(defun request-reading (meter token)
+(defgeneric request-reading (meter session-id))
+
+(defmethod request-reading ((meter electric-meter) (token string))
   "Request a smart meter reading"
   (let ((response-data (smart-meter-request 
                          "https://smartmetertexas.com/api/ondemandread"
@@ -126,14 +140,20 @@
           (status-reason (gethash "statusReason" response-data)))
       (let ((successful-response? (not (equal request-status "FLR")))) 
         (when (not successful-response?)
-          (cond ((equal status-code "5031") (restart-case 
-                                              (error 'too-many-requests-error 
-                                                     :error-message status-reason)
-                                              (try-requesting-reading-again () (request-reading meter token))))
+          (cond ((equal status-code "5031") (error 'too-many-requests-error 
+                                                   :error-message status-reason))
                 (t (error "Reading request failed: ~a" status-reason))))
         t))))
 
-(defun fetch-reading (meter token)
+(defmethod request-reading ((meter electric-meter) (session meter-reading-session))
+  (handler-case (request-reading meter (session-token session))
+    (invalid-token-error () (request-reading meter 
+                                             (refresh-session session)))
+    ))
+
+(defgeneric fetch-reading (meter session-id))
+
+(defmethod fetch-reading ((meter electric-meter) (token string))
   "Retrieve a completed smart meter reading"
   (let ((response-data (smart-meter-request
                          "https://smartmetertexas.com/api/usage/latestodrread"
@@ -144,12 +164,25 @@
           (response-message (gethash "responseMessage" response-data)))
       (let ((successful-reading? (equal status "COMPLETED"))) 
         (if (not successful-reading?)
-            (restart-case 
-              (if (equal status "PENDING")
-                  (error 'reading-not-ready)
-                  (error "Could not fetch reading: ~a" response-message)) 
-              (try-fetching-again () (fetch-reading meter token)))
+            (if (equal status "PENDING")
+                (error 'reading-not-ready)
+                (error "Could not fetch reading: ~a" response-message)) 
             reading)))))
+
+(defmethod fetch-reading ((meter electric-meter) (session meter-reading-session))
+  (let ((reading (handler-case (fetch-reading meter (session-token session))
+                   (invalid-token-error () (fetch-reading meter 
+                                                          (refresh-session session)))
+                   (reading-not-ready () (if (equal (retry-failure-count session)
+                                                    *max-allowed-retry-attempts*) 
+                                             (error (format nil 
+                                                            "Could not not complete fetch reading after ~a attempts" 
+                                                            (retry-failure-count session))) 
+                                             (progn (sleep *fetch-reading-retry-delay*)
+                                                    (incf (retry-failure-count session))
+                                                    (fetch-reading meter session)))))))
+    (setf (retry-failure-count session) 0)
+    reading))
 
 (defun refresh-session (session)
   "Refresh smart meter session, useful when the token has expired"
@@ -158,8 +191,5 @@
 
 (defun read-meter (meter session)
   "High level smart meter reading function, performs requesting and fetching readings"
-  (handler-case (progn (request-reading meter (session-token session))
-                       (fetch-reading meter (session-token session))) 
-    (invalid-token-error 
-      () 
-      (read-meter meter (refresh-session session)))))
+  (request-reading meter session)
+  (fetch-reading meter session))
